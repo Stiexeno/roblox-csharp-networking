@@ -61,7 +61,17 @@ end
 -- bootstrap (eagerly) or on first GetRemote call (lazily); either
 -- way the wait here resolves once the server's first touch has
 -- replicated.
+--
+-- Edit-mode short-circuit: when the place isn't actually running
+-- (Studio plugins requiring user modules for inspection — the
+-- Component editor's discovery sweep is the canonical case),
+-- return nil so the module load succeeds without creating phantom
+-- RemoteEvents in the place file. Real method calls only happen
+-- at play time when RunService:IsRunning() flips true.
 function Networking.GetRemote(name)
+	if not RunService:IsRunning() then
+		return nil
+	end
 	if RunService:IsServer() then
 		return Networking.RegisterRemote(name)
 	end
