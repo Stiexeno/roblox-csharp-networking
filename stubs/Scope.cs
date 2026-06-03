@@ -1,13 +1,14 @@
 namespace Networking
 {
-    // Direction the wire flows. ClientToServer means clients invoke and
-    // the server subscribes; ServerToClient is the inverse. There is no
-    // BothWays — pick a direction and pair two events if you genuinely
-    // need bidirectional traffic (rare in practice; most game state is
-    // owned by one side).
+    /// <summary>
+    /// Wire direction for a <see cref="NetworkEventAttribute"/>.
+    /// </summary>
     public enum Scope
     {
+        /// <summary>Client invokes; server handles. Fires <c>FireServer</c>, connects <c>OnServerEvent</c>.</summary>
         ClientToServer,
+
+        /// <summary>Server invokes; client handles. Fires <c>FireClient</c> / <c>FireAllClients</c>, connects <c>OnClientEvent</c>.</summary>
         ServerToClient,
     }
 }

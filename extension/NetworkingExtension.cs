@@ -14,7 +14,15 @@ using RobloxCSharp.Transformer.Factory;
 
 namespace RobloxCSharp.Extensions.Networking
 {
-
+	/// <summary>
+	/// Transpiler hook backing <see cref="Networking.NetworkEventAttribute"/>.
+	/// Discovers every <c>[NetworkEvent]</c>-tagged field at compile time,
+	/// rewrites <c>field += handler</c> and <c>field?.Invoke(...)</c> into
+	/// RemoteEvent <c>Connect</c> / <c>FireServer</c> / <c>FireClient</c> /
+	/// <c>FireAllClients</c> calls, injects per-module preludes that resolve
+	/// the remote handle, and emits a server bootstrap script that registers
+	/// every discovered remote before any user code runs.
+	/// </summary>
 	public sealed class NetworkingExtension : IRobloxCSharpExtension
 	{
 		private const string AttributeName = "NetworkEventAttribute";
