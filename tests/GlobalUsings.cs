@@ -1,0 +1,15 @@
+global using System;
+global using System.Collections.Generic;
+global using System.IO;
+global using System.Linq;
+global using Microsoft.CodeAnalysis;
+global using Microsoft.CodeAnalysis.CSharp;
+global using Microsoft.CodeAnalysis.CSharp.Syntax;
+global using RobloxCSharp.Common.Diagnostics;
+global using RobloxCSharp.Plugins;
+global using RobloxCSharp.Rojo;
+global using RobloxCSharp.Transformer;
+global using RobloxCSharp.Transformer.AST;
+global using RobloxCSharp.Transformer.AST.Expressions;
+global using RobloxCSharp.Transformer.Extensibility;
+global using RobloxCSharp.Transformer.Factory;
