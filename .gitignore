@@ -4,3 +4,7 @@
 Thumbs.db
 .vscode/
 .idea/
+
+# extension.csproj build intermediates
+extension/bin/
+extension/obj/

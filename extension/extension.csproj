@@ -1,0 +1,89 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!--
+        Builds plugins/Components/extension.dll from the transpiler-time
+        hook sources in this folder. Loaded by the converter's
+        PluginExtensionLoader at startup (preferred over the in-memory
+        compile of the source) so consumers never need to see this
+        code in their project.
+
+        Plugin authors run `dotnet build` from this directory. The
+        $(RobloxCSharpSdk) property must point at a checkout of the
+        main `Stiexeno/roblox-csharp` repo — defaults to an environment
+        variable so each author can set it once.
+    -->
+
+    <PropertyGroup>
+        <TargetFramework>net9.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>disable</Nullable>
+        <AssemblyName>extension</AssemblyName>
+        <RootNamespace>RobloxCSharp.Extensions.Networking</RootNamespace>
+
+        <!-- Drop the produced extension.dll one folder up so the
+             converter picks it up at plugins/Components/extension.dll. -->
+        <OutputPath>..\</OutputPath>
+        <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+        <UseCommonOutputDirectory>true</UseCommonOutputDirectory>
+        <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+        <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+        <DebugType>none</DebugType>
+        <DebugSymbols>false</DebugSymbols>
+        <GenerateDependencyFile>false</GenerateDependencyFile>
+
+        <!-- Pick up from env var if the author didn't pass it on the
+             command line. -->
+        <RobloxCSharpSdk Condition="'$(RobloxCSharpSdk)' == ''">$(ROBLOX_CSHARP_SDK)</RobloxCSharpSdk>
+    </PropertyGroup>
+
+    <Target Name="VerifySdkPath" BeforeTargets="ResolveAssemblyReferences">
+        <Error Condition="'$(RobloxCSharpSdk)' == '' Or !Exists('$(RobloxCSharpSdk)\RobloxCSharp.sln')"
+               Text="Set ROBLOX_CSHARP_SDK (env var) or pass -p:RobloxCSharpSdk=&lt;path&gt; pointing at a checkout of github.com/Stiexeno/roblox-csharp. Current: '$(RobloxCSharpSdk)'." />
+    </Target>
+
+    <!-- Reference the converter's host assemblies via ProjectReference
+         from the main-repo checkout. Private=false keeps the resulting
+         extension.dll lean — referenced DLLs are provided by the
+         converter process at load time. -->
+    <ItemGroup>
+        <ProjectReference Include="$(RobloxCSharpSdk)\RobloxCSharp.Common\RobloxCSharp.Common.csproj">
+            <Private>false</Private>
+            <ReferenceOutputAssembly>true</ReferenceOutputAssembly>
+        </ProjectReference>
+        <ProjectReference Include="$(RobloxCSharpSdk)\RobloxCSharp.Transformer\RobloxCSharp.Transformer.csproj">
+            <Private>false</Private>
+            <ReferenceOutputAssembly>true</ReferenceOutputAssembly>
+        </ProjectReference>
+        <ProjectReference Include="$(RobloxCSharpSdk)\RobloxCSharp.Rojo\RobloxCSharp.Rojo.csproj">
+            <Private>false</Private>
+            <ReferenceOutputAssembly>true</ReferenceOutputAssembly>
+        </ProjectReference>
+        <ProjectReference Include="$(RobloxCSharpSdk)\RobloxCSharp.Compiler\RobloxCSharp.Compiler.csproj">
+            <Private>false</Private>
+            <ReferenceOutputAssembly>true</ReferenceOutputAssembly>
+        </ProjectReference>
+    </ItemGroup>
+
+    <!-- Mirror PluginExtensionLoader.ImplicitUsingsSource so source
+         written without explicit usings (the established style) still
+         builds against the host SDK. -->
+    <ItemGroup>
+        <Using Include="System.IO" />
+        <Using Include="System.Net.Http" />
+        <Using Include="System.Text" />
+        <Using Include="System.Threading" />
+        <Using Include="System.Threading.Tasks" />
+        <Using Include="Microsoft.CodeAnalysis" />
+        <Using Include="Microsoft.CodeAnalysis.CSharp" />
+        <Using Include="Microsoft.CodeAnalysis.CSharp.Syntax" />
+        <Using Include="RobloxCSharp.Common.Diagnostics" />
+        <Using Include="RobloxCSharp.Plugins" />
+        <Using Include="RobloxCSharp.Rojo" />
+        <Using Include="RobloxCSharp.Transformer" />
+        <Using Include="RobloxCSharp.Transformer.AST" />
+        <Using Include="RobloxCSharp.Transformer.AST.Expressions" />
+        <Using Include="RobloxCSharp.Transformer.Extensibility" />
+        <Using Include="RobloxCSharp.Transformer.Factory" />
+    </ItemGroup>
+
+</Project>
