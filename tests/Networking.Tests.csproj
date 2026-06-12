@@ -8,7 +8,7 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-		<Compile Include="..\extension\**\*.cs" LinkBase="extension" />
+		<Compile Include="..\extension\**\*.cs" Exclude="..\extension\bin\**;..\extension\obj\**" LinkBase="extension" />
 	</ItemGroup>
 
 	<ItemGroup>

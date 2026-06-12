@@ -44,7 +44,12 @@ namespace RobloxCSharp.RobloxApi
 
 		public static void OnCompile(IRobloxCSharpExtension extension, CSharpCompilation compilation)
 		{
-			extension.OnCompile(compilation, Array.Empty<Plugin>(), new DiagnosticBag());
+			OnCompile(extension, compilation, new DiagnosticBag());
+		}
+
+		public static void OnCompile(IRobloxCSharpExtension extension, CSharpCompilation compilation, DiagnosticBag diagnostics)
+		{
+			extension.OnCompile(compilation, Array.Empty<Plugin>(), diagnostics);
 		}
 
 		public static T FirstNode<T>(CompilationUnitSyntax root) where T : SyntaxNode

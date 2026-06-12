@@ -44,17 +44,19 @@ public class Test
 		}
 
 		[Fact]
-		public void OnCompile_Discovers_AllNetworkEventFields_AndSuppressesContainers()
+		public void OnCompile_Discovers_AllNetworkEventFields_AndSuppressesContainersAndStubs()
 		{
 			(TransformerState state, NetworkingExtension ext, CompilationUnitSyntax root) = Setup("void Run() {}");
 
-			IEnumerable<INamedTypeSymbol> suppressed = ext.SuppressImports(root, state);
+			List<INamedTypeSymbol> suppressed = ext.SuppressImports(root, state).ToList();
 
 			Assert.Contains(suppressed, t => t.Name == "Events");
+			Assert.Contains(suppressed, t => t.Name == "Scope");
+			Assert.Contains(suppressed, t => t.Name == "NetworkEventAttribute");
 		}
 
 		[Fact]
-		public void ClientToServerSubscribe_LowersToOnServerEventConnect()
+		public void ClientToServerSubscribe_LowersToRuntimeConnect_WithValidation()
 		{
 			(TransformerState state, NetworkingExtension ext, CompilationUnitSyntax root) = Setup(@"
 				void Run() {
@@ -67,17 +69,21 @@ public class Test
 			LuaInvocationExpression connect = Assert.IsType<LuaInvocationExpression>(result);
 			LuaMemberAccessExpression connectMember = Assert.IsType<LuaMemberAccessExpression>(connect.Expression);
 			Assert.Equal("Connect", connectMember.MemberName);
-			Assert.True(connectMember.IsMethodCall);
+			Assert.Equal("_Networking", Assert.IsType<LuaIdentifier>(connectMember.Target).Name);
 
-			LuaMemberAccessExpression signalAccess = Assert.IsType<LuaMemberAccessExpression>(connectMember.Target);
-			Assert.Equal("OnServerEvent", signalAccess.MemberName);
+			// remote, eventName, signalName, key, handler(nil), paramTypes
+			Assert.Equal(6, connect.Arguments.Count);
+			Assert.Equal("_evt_ChatSubmitted", Assert.IsType<LuaIdentifier>(connect.Arguments[0]).Name);
+			Assert.Equal("ChatSubmitted", Assert.IsType<LuaLiteralExpression>(connect.Arguments[1]).Value);
+			Assert.Equal("OnServerEvent", Assert.IsType<LuaLiteralExpression>(connect.Arguments[2]).Value);
+			Assert.Null(Assert.IsType<LuaLiteralExpression>(connect.Arguments[4]).Value);
 
-			LuaIdentifier remoteLocal = Assert.IsType<LuaIdentifier>(signalAccess.Target);
-			Assert.Equal("_evt_ChatSubmitted", remoteLocal.Name);
+			LuaTableExpression types = Assert.IsType<LuaTableExpression>(connect.Arguments[5]);
+			Assert.Equal("string", Assert.IsType<LuaLiteralExpression>(Assert.Single(types.Elements)).Value);
 		}
 
 		[Fact]
-		public void ServerToClientSubscribe_LowersToOnClientEventConnect()
+		public void ServerToClientSubscribe_LowersToRuntimeConnect_OnClientEvent()
 		{
 			(TransformerState state, NetworkingExtension ext, CompilationUnitSyntax root) = Setup(@"
 				void Run() {
@@ -89,8 +95,31 @@ public class Test
 
 			LuaInvocationExpression connect = Assert.IsType<LuaInvocationExpression>(result);
 			LuaMemberAccessExpression connectMember = Assert.IsType<LuaMemberAccessExpression>(connect.Expression);
-			LuaMemberAccessExpression signalAccess = Assert.IsType<LuaMemberAccessExpression>(connectMember.Target);
-			Assert.Equal("OnClientEvent", signalAccess.MemberName);
+			Assert.Equal("Connect", connectMember.MemberName);
+
+			// remote, eventName, signalName, key — no wrapper, no validation.
+			Assert.Equal(4, connect.Arguments.Count);
+			Assert.Equal("OnClientEvent", Assert.IsType<LuaLiteralExpression>(connect.Arguments[2]).Value);
+		}
+
+		[Fact]
+		public void SubtractAssignment_LowersToRuntimeDisconnect()
+		{
+			(TransformerState state, NetworkingExtension ext, CompilationUnitSyntax root) = Setup(@"
+				static void Handler(string msg) { }
+				void Run() {
+					Events.BroadcastBanner -= Handler;
+				}");
+
+			AssignmentExpressionSyntax assign = TestHarness.FirstNode<AssignmentExpressionSyntax>(root);
+			LuaNode result = ext.TryRewrite(assign, state);
+
+			LuaInvocationExpression disconnect = Assert.IsType<LuaInvocationExpression>(result);
+			LuaMemberAccessExpression member = Assert.IsType<LuaMemberAccessExpression>(disconnect.Expression);
+			Assert.Equal("Disconnect", member.MemberName);
+			Assert.Equal("_Networking", Assert.IsType<LuaIdentifier>(member.Target).Name);
+			Assert.Equal(2, disconnect.Arguments.Count);
+			Assert.Equal("_evt_BroadcastBanner", Assert.IsType<LuaIdentifier>(disconnect.Arguments[0]).Name);
 		}
 
 		[Fact]
@@ -113,7 +142,28 @@ public class Test
 		}
 
 		[Fact]
-		public void ServerToClientFire_NullTarget_LowersToFireAllClients()
+		public void ServerToClientFire_PlayerTarget_RoutesThroughRuntimeFireClient()
+		{
+			(TransformerState state, NetworkingExtension ext, CompilationUnitSyntax root) = Setup(@"
+				void Run(RobloxCSharp.RobloxApi.Player p) {
+					Events.ScoreUpdate?.Invoke(p, 42);
+				}");
+
+			ExpressionStatementSyntax stmt = TestHarness.FirstNode<ExpressionStatementSyntax>(root);
+			LuaNode result = ext.TryRewrite(stmt, state);
+
+			// Runtime branches on the target at runtime: nil → FireAllClients,
+			// player → FireClient. A nil VARIABLE must broadcast, not error.
+			LuaInvocationExpression call = Assert.IsType<LuaInvocationExpression>(result);
+			LuaMemberAccessExpression method = Assert.IsType<LuaMemberAccessExpression>(call.Expression);
+			Assert.Equal("FireClient", method.MemberName);
+			Assert.Equal("_Networking", Assert.IsType<LuaIdentifier>(method.Target).Name);
+			Assert.Equal(3, call.Arguments.Count);
+			Assert.Equal("_evt_ScoreUpdate", Assert.IsType<LuaIdentifier>(call.Arguments[0]).Name);
+		}
+
+		[Fact]
+		public void ServerToClientFire_NullLiteralTarget_AlsoRoutesThroughRuntimeFireClient()
 		{
 			(TransformerState state, NetworkingExtension ext, CompilationUnitSyntax root) = Setup(@"
 				void Run() {
@@ -125,24 +175,8 @@ public class Test
 
 			LuaInvocationExpression call = Assert.IsType<LuaInvocationExpression>(result);
 			LuaMemberAccessExpression method = Assert.IsType<LuaMemberAccessExpression>(call.Expression);
-			Assert.Equal("FireAllClients", method.MemberName);
-		}
-
-		[Fact]
-		public void ServerToClientFire_SpecificPlayer_LowersToFireClient()
-		{
-			(TransformerState state, NetworkingExtension ext, CompilationUnitSyntax root) = Setup(@"
-				void Run(RobloxCSharp.RobloxApi.Player p) {
-					Events.ScoreUpdate?.Invoke(p, 42);
-				}");
-
-			ExpressionStatementSyntax stmt = TestHarness.FirstNode<ExpressionStatementSyntax>(root);
-			LuaNode result = ext.TryRewrite(stmt, state);
-
-			LuaInvocationExpression call = Assert.IsType<LuaInvocationExpression>(result);
-			LuaMemberAccessExpression method = Assert.IsType<LuaMemberAccessExpression>(call.Expression);
 			Assert.Equal("FireClient", method.MemberName);
-			Assert.Equal(2, call.Arguments.Count);
+			Assert.Equal(3, call.Arguments.Count);
 		}
 
 		[Fact]
@@ -243,6 +277,41 @@ public static class Mixed
 			LuaNode result = ext.TryRewrite(root, state);
 
 			Assert.Null(result);
+		}
+
+		[Fact]
+		public void MixedContainer_ReportsRC0020()
+		{
+			string source = @"
+using System;
+using Networking;
+
+public static class Mixed
+{
+	[NetworkEvent(Scope.ClientToServer)]
+	public static Action<string> Evt;
+
+	public static int RegularField;
+}
+";
+			(_, _, var compilation) = TestHarness.Compile(source);
+			NetworkingExtension ext = new();
+			DiagnosticBag diagnostics = new();
+			TestHarness.OnCompile(ext, compilation, diagnostics);
+
+			Assert.Contains(diagnostics.Items, d =>
+				d.Code == "RC0020" && d.Message.Contains("RegularField"));
+		}
+
+		[Fact]
+		public void PureContainer_ReportsNothing()
+		{
+			(_, _, var compilation) = TestHarness.Compile(EventsDecl);
+			NetworkingExtension ext = new();
+			DiagnosticBag diagnostics = new();
+			TestHarness.OnCompile(ext, compilation, diagnostics);
+
+			Assert.Empty(diagnostics.Items);
 		}
 
 		[Fact]

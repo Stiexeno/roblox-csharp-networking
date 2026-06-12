@@ -17,28 +17,41 @@ namespace RobloxCSharp.Extensions.Networking
 	/// <summary>
 	/// Transpiler hook backing <see cref="Networking.NetworkEventAttribute"/>.
 	/// Discovers every <c>[NetworkEvent]</c>-tagged field at compile time,
-	/// rewrites <c>field += handler</c> and <c>field?.Invoke(...)</c> into
-	/// RemoteEvent <c>Connect</c> / <c>FireServer</c> / <c>FireClient</c> /
-	/// <c>FireAllClients</c> calls, injects per-module preludes that resolve
-	/// the remote handle, and emits a server bootstrap script that registers
-	/// every discovered remote before any user code runs.
+	/// rewrites <c>field += handler</c> / <c>field -= handler</c> and
+	/// <c>field?.Invoke(...)</c> into runtime <c>Connect</c> /
+	/// <c>Disconnect</c> / fire calls, injects per-module preludes that
+	/// resolve the remote handle, and emits a server bootstrap script that
+	/// registers every discovered remote before any user code runs.
 	/// </summary>
-	public sealed class NetworkingExtension : IRobloxCSharpExtension
+	public sealed partial class NetworkingExtension : IRobloxCSharpExtension
 	{
 		private const string AttributeName = "NetworkEventAttribute";
 		private const string AttributeNamespace = "Networking";
 		private const string PlayerTypeName = "Player";
+		private const string InstanceTypeName = "Instance";
 		private const string NetworkingRequireLocal = "_Networking";
 		private const string PreludeLocalPrefix = "_evt_";
 		private const string GetRemoteMethod = "GetRemote";
 		private const string RegisterRemoteMethod = "RegisterRemote";
+		private const string ConnectMethod = "Connect";
+		private const string DisconnectMethod = "Disconnect";
+		private const string FireClientMethod = "FireClient";
+		private const string ClientToServerScope = "ClientToServer";
+		private const string AnyParamType = "any";
 
-		private sealed record EventInfo(string Name, string Scope, bool FirstParamIsPlayer);
+		private sealed record EventInfo(
+			string Name, string Scope, bool FirstParamIsPlayer, IReadOnlyList<string> WireParamTypes);
 
 		private readonly Dictionary<IFieldSymbol, EventInfo> _events =
 			new(SymbolEqualityComparer.Default);
 
 		private readonly HashSet<INamedTypeSymbol> _eventContainers =
+			new(SymbolEqualityComparer.Default);
+
+		// The plugin's own stub types (Scope, NetworkEventAttribute). They
+		// have no runtime/*.luau counterpart, so any would-be import of
+		// them must be suppressed alongside the event containers.
+		private readonly HashSet<INamedTypeSymbol> _stubTypes =
 			new(SymbolEqualityComparer.Default);
 
 		public string Name => "Networking";
@@ -47,6 +60,7 @@ namespace RobloxCSharp.Extensions.Networking
 		{
 			_events.Clear();
 			_eventContainers.Clear();
+			_stubTypes.Clear();
 			foreach (SyntaxTree tree in compilation.SyntaxTrees)
 			{
 				SemanticModel sm = compilation.GetSemanticModel(tree);
@@ -58,7 +72,10 @@ namespace RobloxCSharp.Extensions.Networking
 					{
 						if (sm.GetDeclaredSymbol(decl) is not IFieldSymbol symbol) continue;
 						if (!TryReadScope(symbol, out string scope)) continue;
-						_events[symbol] = new EventInfo(symbol.Name, scope, FirstTypeArgIsPlayer(symbol.Type));
+						bool firstParamIsPlayer = FirstTypeArgIsPlayer(symbol.Type);
+						_events[symbol] = new EventInfo(
+							symbol.Name, scope, firstParamIsPlayer,
+							BuildWireParamTypes(symbol.Type, firstParamIsPlayer));
 						if (symbol.ContainingType is not null)
 						{
 							_eventContainers.Add(symbol.ContainingType);
@@ -66,6 +83,9 @@ namespace RobloxCSharp.Extensions.Networking
 					}
 				}
 			}
+
+			CollectStubTypes(compilation);
+			ReportMixedContainers(diagnostics);
 		}
 
 		public LuaNode TryRewrite(SyntaxNode syntax, TransformerState state)
@@ -80,12 +100,15 @@ namespace RobloxCSharp.Extensions.Networking
 			}
 
 			if (syntax is AssignmentExpressionSyntax assign
-				&& assign.IsKind(SyntaxKind.AddAssignmentExpression))
+				&& (assign.IsKind(SyntaxKind.AddAssignmentExpression)
+					|| assign.IsKind(SyntaxKind.SubtractAssignmentExpression)))
 			{
 				if (state.SemanticModel.GetSymbolInfo(assign.Left).Symbol is IFieldSymbol field
 					&& _events.TryGetValue(field, out EventInfo info))
 				{
-					return RewriteSubscribe(info, assign.Right, state);
+					return assign.IsKind(SyntaxKind.AddAssignmentExpression)
+						? RewriteSubscribe(info, assign, state)
+						: RewriteUnsubscribe(info, assign, state);
 				}
 			}
 
@@ -111,7 +134,7 @@ namespace RobloxCSharp.Extensions.Networking
 				if (state.SemanticModel.GetSymbolInfo(cond.Expression).Symbol is IFieldSymbol field
 					&& _events.TryGetValue(field, out EventInfo info))
 				{
-					return RewriteFire(info, condInvoke.ArgumentList, state);
+					return RewriteFire(info, cond, condInvoke.ArgumentList, state);
 				}
 			}
 
@@ -122,116 +145,11 @@ namespace RobloxCSharp.Extensions.Networking
 				if (state.SemanticModel.GetSymbolInfo(memberAccess.Expression).Symbol is IFieldSymbol field
 					&& _events.TryGetValue(field, out EventInfo info))
 				{
-					return RewriteFire(info, invoke.ArgumentList, state);
+					return RewriteFire(info, invoke, invoke.ArgumentList, state);
 				}
 			}
 
 			return null;
-		}
-
-		private LuaNode RewriteSubscribe(EventInfo info, ExpressionSyntax handler, TransformerState state)
-		{
-			string signalProperty = info.Scope == "ClientToServer" ? "OnServerEvent" : "OnClientEvent";
-			string remoteLocal = PreludeLocalPrefix + info.Name;
-
-			bool injectLocalPlayer = info.Scope == "ServerToClient" && info.FirstParamIsPlayer;
-			LuaExpression handlerExpr = injectLocalPlayer
-				? BuildLocalPlayerForwardingHandler(state, handler)
-				: BindInstanceMethodIfNeeded(state, handler);
-
-			LuaInvocationExpression connect = LuaFactory.Invocation(
-				LuaFactory.MemberAccess(
-					LuaFactory.MemberAccess(remoteLocal, signalProperty),
-					"Connect",
-					isMethodCall: true));
-			connect.Arguments.Add(handlerExpr);
-			return connect;
-		}
-
-		private static LuaExpression BuildLocalPlayerForwardingHandler(TransformerState state, ExpressionSyntax handlerSyntax)
-		{
-			LuaInvocationExpression getPlayers = LuaFactory.Invocation(
-				LuaFactory.MemberAccess("game", "GetService", isMethodCall: true));
-			getPlayers.Arguments.Add(LuaFactory.LiteralExpression("Players"));
-			LuaExpression localPlayer = LuaFactory.MemberAccess(getPlayers, "LocalPlayer");
-
-			LuaInvocationExpression call;
-			if (state.SemanticModel.GetSymbolInfo(handlerSyntax).Symbol is IMethodSymbol method
-				&& !method.IsStatic
-				&& handlerSyntax is IdentifierNameSyntax)
-			{
-
-				call = LuaFactory.Invocation(
-					LuaFactory.MemberAccess(
-						LuaFactory.Identifier(Syntax.Self), method.Name, isMethodCall: true));
-			}
-			else
-			{
-
-				LuaExpression handler = state.Transform(handlerSyntax) as LuaExpression;
-				call = LuaFactory.Invocation(handler);
-			}
-
-			call.Arguments.Add(localPlayer);
-			call.Arguments.Add(LuaFactory.Identifier("..."));
-
-			return LuaFactory.Function(
-				statements: new[] { (LuaNode)LuaFactory.Return(call) },
-				parameters: new[] { (LuaNode)LuaFactory.Identifier("...") });
-		}
-
-		private static LuaExpression BindInstanceMethodIfNeeded(TransformerState state, ExpressionSyntax handlerSyntax)
-		{
-			LuaExpression handler = state.Transform(handlerSyntax) as LuaExpression;
-			if (handler is null) return null;
-
-			if (state.SemanticModel.GetSymbolInfo(handlerSyntax).Symbol is not IMethodSymbol method) return handler;
-			if (method.IsStatic) return handler;
-			if (handlerSyntax is not IdentifierNameSyntax) return handler;
-
-			LuaInvocationExpression call = LuaFactory.Invocation(
-				LuaFactory.MemberAccess(LuaFactory.Identifier(Syntax.Self), method.Name, isMethodCall: true));
-			call.Arguments.Add(LuaFactory.Identifier("..."));
-
-			return LuaFactory.Function(
-				statements: new[] { (LuaNode)LuaFactory.Return(call) },
-				parameters: new[] { (LuaNode)LuaFactory.Identifier("...") });
-		}
-
-		private LuaNode RewriteFire(EventInfo info, ArgumentListSyntax args, TransformerState state)
-		{
-			string remoteLocal = PreludeLocalPrefix + info.Name;
-
-			if (info.Scope == "ClientToServer")
-			{
-				int skip = info.FirstParamIsPlayer ? 1 : 0;
-				return BuildFireCall(remoteLocal, "FireServer", args, skip, state);
-			}
-
-			if (info.FirstParamIsPlayer && args.Arguments.Count > 0)
-			{
-				ArgumentSyntax targetArg = args.Arguments[0];
-				bool targetIsNull = targetArg.Expression is LiteralExpressionSyntax lit
-					&& lit.IsKind(SyntaxKind.NullLiteralExpression);
-
-				return targetIsNull
-					? BuildFireCall(remoteLocal, "FireAllClients", args, skip: 1, state)
-					: BuildFireCall(remoteLocal, "FireClient", args, skip: 0, state);
-			}
-
-			return BuildFireCall(remoteLocal, "FireAllClients", args, skip: 0, state);
-		}
-
-		private static LuaInvocationExpression BuildFireCall(
-			string remoteLocal, string method, ArgumentListSyntax args, int skip, TransformerState state)
-		{
-			LuaInvocationExpression call = LuaFactory.Invocation(
-				LuaFactory.MemberAccess(remoteLocal, method, isMethodCall: true));
-			for (int i = skip; i < args.Arguments.Count; i++)
-			{
-				call.Arguments.Add(state.Transform(args.Arguments[i].Expression) as LuaExpression);
-			}
-			return call;
 		}
 
 		public IEnumerable<INamedTypeSymbol> ContributeImports(CompilationUnitSyntax syntax, TransformerState state)
@@ -241,16 +159,19 @@ namespace RobloxCSharp.Extensions.Networking
 
 		public IEnumerable<INamedTypeSymbol> SuppressImports(CompilationUnitSyntax syntax, TransformerState state)
 		{
-			return _eventContainers;
+			return _eventContainers.Concat(_stubTypes);
 		}
 
 		public void OnUnitTransformed(LuaCompilationUnit unit, CompilationUnitSyntax syntax, TransformerState state)
 		{
+			// Identifier scan covers both shapes: the `.Name` of a qualified
+			// `Events.ChatSubmitted` and a bare `ChatSubmitted` brought in
+			// via `using static` both bind to the field symbol.
 			HashSet<string> referenced = new(StringComparer.Ordinal);
-			foreach (MemberAccessExpressionSyntax ma in syntax.DescendantNodes()
-				.OfType<MemberAccessExpressionSyntax>())
+			foreach (IdentifierNameSyntax id in syntax.DescendantNodes()
+				.OfType<IdentifierNameSyntax>())
 			{
-				if (state.SemanticModel.GetSymbolInfo(ma).Symbol is IFieldSymbol field
+				if (state.SemanticModel.GetSymbolInfo(id).Symbol is IFieldSymbol field
 					&& _events.TryGetValue(field, out EventInfo info))
 				{
 					referenced.Add(info.Name);
@@ -284,7 +205,7 @@ namespace RobloxCSharp.Extensions.Networking
 		{
 			if (_events.Count == 0) return;
 
-			string bootstrapDir = Path.Combine(outDir, "server");
+			string bootstrapDir = ResolveBootstrapDir(outDir, resolver);
 			Directory.CreateDirectory(bootstrapDir);
 			string bootstrapPath = Path.Combine(bootstrapDir, "_NetworkEventsBootstrap.server.luau");
 
@@ -302,80 +223,6 @@ namespace RobloxCSharp.Extensions.Networking
 			}
 
 			File.WriteAllText(bootstrapPath, sb.ToString());
-		}
-
-		private static bool TryReadScope(IFieldSymbol symbol, out string scope)
-		{
-			foreach (AttributeData attr in symbol.GetAttributes())
-			{
-				if (attr.AttributeClass is not { Name: AttributeName } cls) continue;
-				if (cls.ContainingNamespace?.Name != AttributeNamespace) continue;
-				if (attr.ConstructorArguments.Length == 0) continue;
-
-				TypedConstant arg = attr.ConstructorArguments[0];
-				if (arg.Type is not INamedTypeSymbol enumType || arg.Value is not int value) continue;
-
-				foreach (ISymbol member in enumType.GetMembers())
-				{
-					if (member is IFieldSymbol f && f.HasConstantValue
-						&& f.ConstantValue is int v && v == value)
-					{
-						scope = f.Name;
-						return true;
-					}
-				}
-			}
-			scope = null;
-			return false;
-		}
-
-		private static bool FirstTypeArgIsPlayer(ITypeSymbol type)
-		{
-			return type is INamedTypeSymbol named
-				&& named.TypeArguments.Length > 0
-				&& named.TypeArguments[0].Name == PlayerTypeName;
-		}
-
-		private bool IsNetworkEventOnlyFile(CompilationUnitSyntax unit, TransformerState state)
-		{
-			if (_events.Count == 0) return false;
-
-			bool sawNetworkEvent = false;
-			return WalkMembers(unit.Members, state, ref sawNetworkEvent) && sawNetworkEvent;
-		}
-
-		private bool WalkMembers(SyntaxList<MemberDeclarationSyntax> members, TransformerState state, ref bool sawNetworkEvent)
-		{
-			foreach (MemberDeclarationSyntax m in members)
-			{
-				switch (m)
-				{
-					case BaseNamespaceDeclarationSyntax ns:
-						if (!WalkMembers(ns.Members, state, ref sawNetworkEvent)) return false;
-						break;
-					case ClassDeclarationSyntax cls:
-						foreach (MemberDeclarationSyntax cm in cls.Members)
-						{
-							if (cm is not FieldDeclarationSyntax field) return false;
-							foreach (VariableDeclaratorSyntax decl in field.Declaration.Variables)
-							{
-								if (state.SemanticModel.GetDeclaredSymbol(decl) is IFieldSymbol s
-									&& _events.ContainsKey(s))
-								{
-									sawNetworkEvent = true;
-								}
-								else
-								{
-									return false;
-								}
-							}
-						}
-						break;
-					default:
-						return false;
-				}
-			}
-			return true;
 		}
 	}
 }
